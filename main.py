@@ -8,10 +8,10 @@
 
 import os
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -50,6 +50,10 @@ def env_required(name: str) -> str:
     return value
 
 
+_models_lock = Lock()
+_models: Optional[Dict[str, Any]] = None
+
+
 def load_model(model: Any, filename: str) -> Any:
     model_path = BASE_DIR / filename
     try:
@@ -62,12 +66,42 @@ def load_model(model: Any, filename: str) -> Any:
     return model
 
 
-model = load_model(xgb.XGBRegressor(), "weather_xgboost_model.json")
-temp_model = load_model(xgb.XGBRegressor(), "temp_xgboost_model.json")
-model_3d = load_model(xgb.XGBRegressor(), "weather_xgboost_3d_model.json")
-temp_model_3d = load_model(xgb.XGBRegressor(), "temp_xgboost_3d_model.json")
-prob_model = load_model(xgb.XGBClassifier(), "rain_prob_xgboost_model.json")
-prob_model_3d = load_model(xgb.XGBClassifier(), "rain_prob_xgboost_3d_model.json")
+def get_models() -> Dict[str, Any]:
+    global _models
+
+    if _models is not None:
+        return _models
+
+    with _models_lock:
+        if _models is not None:
+            return _models
+
+        try:
+            import xgboost as xgb
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="xgboost is not installed in the container.",
+            ) from exc
+
+        _models = {
+            "model": load_model(xgb.XGBRegressor(), "weather_xgboost_model.json"),
+            "temp_model": load_model(xgb.XGBRegressor(), "temp_xgboost_model.json"),
+            "model_3d": load_model(xgb.XGBRegressor(), "weather_xgboost_3d_model.json"),
+            "temp_model_3d": load_model(
+                xgb.XGBRegressor(),
+                "temp_xgboost_3d_model.json",
+            ),
+            "prob_model": load_model(
+                xgb.XGBClassifier(),
+                "rain_prob_xgboost_model.json",
+            ),
+            "prob_model_3d": load_model(
+                xgb.XGBClassifier(),
+                "rain_prob_xgboost_3d_model.json",
+            ),
+        }
+        return _models
 
 
 class WeatherInput(BaseModel):
@@ -117,15 +151,16 @@ def build_input_frame(data: WeatherInput) -> pd.DataFrame:
 
 def calculate_prediction(data: WeatherInput) -> Dict[str, Any]:
     input_data = build_input_frame(data)
+    models = get_models()
 
     try:
-        prediction = model.predict(input_data)[0]
-        temp_prediction = temp_model.predict(input_data)[0]
-        rain_prob = prob_model.predict_proba(input_data)[0][1] * 100
+        prediction = models["model"].predict(input_data)[0]
+        temp_prediction = models["temp_model"].predict(input_data)[0]
+        rain_prob = models["prob_model"].predict_proba(input_data)[0][1] * 100
 
-        prediction_3d = model_3d.predict(input_data)[0]
-        temp_prediction_3d = temp_model_3d.predict(input_data)[0]
-        rain_prob_3d = prob_model_3d.predict_proba(input_data)[0][1] * 100
+        prediction_3d = models["model_3d"].predict(input_data)[0]
+        temp_prediction_3d = models["temp_model_3d"].predict(input_data)[0]
+        rain_prob_3d = models["prob_model_3d"].predict_proba(input_data)[0][1] * 100
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -217,6 +252,7 @@ def predict_and_send(payload: PredictionSMSRequest) -> Dict[str, Any]:
 
 @app.post("/forecast_3d")
 def forecast_3d(data: HistoricalWeatherInput) -> Dict[str, List[Dict[str, Any]]]:
+    models = get_models()
     df = pd.DataFrame(
         {
             "time": data.hourly_times,
@@ -256,9 +292,9 @@ def forecast_3d(data: HistoricalWeatherInput) -> Dict[str, List[Dict[str, Any]]]
 
     X = df_valid[EXPECTED_COLS]
 
-    preds_precip = model_3d.predict(X)
-    preds_temp = temp_model_3d.predict(X)
-    preds_prob = prob_model_3d.predict_proba(X)[:, 1] * 100
+    preds_precip = models["model_3d"].predict(X)
+    preds_temp = models["temp_model_3d"].predict(X)
+    preds_prob = models["prob_model_3d"].predict_proba(X)[:, 1] * 100
 
     df_valid["time"] = pd.to_datetime(df_valid["time"])
     future_times = df_valid["time"] + pd.Timedelta(days=3)
